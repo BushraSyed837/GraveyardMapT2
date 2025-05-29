@@ -6,22 +6,39 @@ import VectorLayer from 'ol/layer/Vector';
 import VectorSource from 'ol/source/Vector';
 import OSM from 'ol/source/OSM';
 import { Feature } from 'ol';
-import { Point, Polygon } from 'ol/geom';
+import { Polygon } from 'ol/geom';
 import { Style, Fill, Stroke } from 'ol/style';
-import { fromLonLat } from 'ol/proj';
+import { fromLonLat, transform } from 'ol/proj';
+import { register } from 'ol/proj/proj4';
+import proj4 from 'proj4';
 import { CemeteryService } from '../../services/cemetery.service';
-import { Grave, GravePlot, Person, GeoJSONResponse, GeoJSONFeature } from '../../models/grave.model';
+import {
+  Grave,
+  GeoJSONResponse,
+  Person,
+} from '../../models/grave.model';
 import { CommonModule } from '@angular/common';
 import { HttpClientModule } from '@angular/common/http';
 import { forkJoin } from 'rxjs';
 import { defaults as defaultControls } from 'ol/control';
+import {
+  extend as extendExtent,
+  createEmpty as createEmptyExtent,
+} from 'ol/extent';
+
+// Register EPSG:25832
+proj4.defs(
+  'EPSG:25832',
+  '+proj=utm +zone=32 +ellps=GRS80 +units=m +no_defs'
+);
+register(proj4);
 
 @Component({
   selector: 'app-map',
   standalone: true,
   imports: [CommonModule, HttpClientModule],
   templateUrl: './map.component.html',
-  styleUrls: ['./map.component.css']
+  styleUrls: ['./map.component.css'],
 })
 export class MapComponent implements OnInit {
   private map!: Map;
@@ -34,20 +51,19 @@ export class MapComponent implements OnInit {
   error: string | null = null;
 
   constructor(private cemeteryService: CemeteryService) {
-    // Initialize layers immediately with default styles
     this.gravesLayer = new VectorLayer({
       source: this.gravesSource,
       style: new Style({
         fill: new Fill({ color: 'rgba(128, 128, 128, 0.2)' }),
-        stroke: new Stroke({ color: '#666666', width: 1 })
-      })
+        stroke: new Stroke({ color: '#666666', width: 1 }),
+      }),
     });
     this.plotsLayer = new VectorLayer({
       source: this.plotsSource,
       style: new Style({
         fill: new Fill({ color: 'rgba(128, 128, 128, 0.2)' }),
-        stroke: new Stroke({ color: '#666666', width: 1 })
-      })
+        stroke: new Stroke({ color: '#666666', width: 1 }),
+      }),
     });
   }
 
@@ -61,39 +77,40 @@ export class MapComponent implements OnInit {
       target: 'map',
       controls: defaultControls(),
       layers: [
-        new TileLayer({ 
-          source: new OSM(),
-          preload: Infinity // Preload tiles
-        }),
+        new TileLayer({ source: new OSM() }),
         this.plotsLayer,
-        this.gravesLayer
+        this.gravesLayer,
       ],
       view: new View({
-        center: [386858, 5664073],
-        zoom: 19,
-        minZoom: 17,
-        maxZoom: 20
-      })
+        center: fromLonLat([7.6, 51.96]), // Center of Münster
+        zoom: 17,
+        minZoom: 16,
+        maxZoom: 20,
+      }),
     });
 
     this.map.on('click', (event) => {
-      const feature = this.map.forEachFeatureAtPixel(event.pixel, (feature) => {
-        if (feature instanceof Feature) {
-          return feature;
-        }
-        return null;
-      });
+      const feature = this.map.forEachFeatureAtPixel(
+        event.pixel,
+        (feature) => feature as Feature
+      );
       if (feature) {
         this.selectedFeature = feature;
       }
     });
   }
 
+  private transformCoordinatesFrom25832To3857(coords: number[][]): number[][] {
+    return coords.map((coord) =>
+      transform(coord, 'EPSG:25832', 'EPSG:3857')
+    );
+  }
+
   private processCoordinates(coords: unknown): number[][] {
     if (!Array.isArray(coords)) {
       throw new Error('Coordinates must be an array');
     }
-    
+
     if (Array.isArray(coords[0]) && Array.isArray(coords[0][0])) {
       return coords[0] as number[][];
     }
@@ -101,124 +118,108 @@ export class MapComponent implements OnInit {
   }
 
   private loadData(): void {
-    console.log('Starting to load data...');
     this.isLoading = true;
     this.error = null;
 
-    // Create default styles once
     const expiredGraveStyle = new Style({
       fill: new Fill({ color: 'rgba(255, 0, 0, 0.4)' }),
-      stroke: new Stroke({ color: 'darkred', width: 2 })
+      stroke: new Stroke({ color: 'darkred', width: 2 }),
     });
 
     const occupiedPlotStyle = new Style({
       fill: new Fill({ color: 'rgba(0, 255, 0, 0.4)' }),
-      stroke: new Stroke({ color: 'darkgreen', width: 2 })
+      stroke: new Stroke({ color: 'darkgreen', width: 2 }),
     });
 
     forkJoin({
       graves: this.cemeteryService.getGraves(),
-      plots: this.cemeteryService.getGravePlots()
+      plots: this.cemeteryService.getGravePlots(),
     }).subscribe({
       next: (response) => {
-        console.log('Data received:', response);
-        
-        // Process graves
+        // Graves
         if (response.graves.features?.length) {
-          console.log(`Processing ${response.graves.features.length} graves...`);
           const features = response.graves.features
-            .filter(feature => feature.geometry?.coordinates)
-            .map(feature => {
+            .filter((f) => f.geometry?.coordinates)
+            .map((f) => {
               try {
-                const coordinates = this.processCoordinates(feature.geometry.coordinates);
-
-                const mapFeature = new Feature({
-                  geometry: new Polygon([coordinates]),
-                  properties: feature.properties
+                const coords = this.transformCoordinatesFrom25832To3857(
+                  this.processCoordinates(f.geometry.coordinates)
+                );
+                const feat = new Feature({
+                  geometry: new Polygon([coords]),
+                  properties: f.properties,
                 });
 
-                // Set style if expired
-                const grave = feature.properties as Grave;
+                const grave = f.properties as Grave;
                 if (new Date(grave.nutzungsfristende) < new Date()) {
-                  mapFeature.setStyle(expiredGraveStyle);
+                  feat.setStyle(expiredGraveStyle);
                 }
-                // console.log('Grave feature processed:', mapFeature);
-
-                return mapFeature;
+                return feat;
               } catch (e) {
-                console.error('Error processing grave:', e);
+                console.error('Grave error:', e);
                 return null;
               }
             })
-            .filter(feature => feature !== null) as Feature[];
+            .filter((f) => f !== null) as Feature[];
 
           this.gravesSource.addFeatures(features);
-        } else {
-          console.warn('No grave features found in response');
         }
 
-        // Process plots
+        // Plots
         if (response.plots.features?.length) {
-          console.log(`Processing ${response.plots.features.length} plots...`);
           const features = response.plots.features
-            .filter(feature => feature.geometry?.coordinates)
-            .map(feature => {
+            .filter((f) => f.geometry?.coordinates)
+            .map((f) => {
               try {
-                const coordinates = this.processCoordinates(feature.geometry.coordinates);
-                console.log('Plot properties:', feature.properties);
-
-                const mapFeature = new Feature({
-                  geometry: new Polygon([coordinates]),
-                  properties: feature.properties
+                const coords = this.transformCoordinatesFrom25832To3857(
+                  this.processCoordinates(f.geometry.coordinates)
+                );
+                const feat = new Feature({
+                  geometry: new Polygon([coords]),
+                  properties: f.properties,
                 });
 
-                // Set style if occupied
-                const plot = feature.properties as Grave;
-                console.log('Plot verstorbene:', plot.verstorbene);
-                
-                // Check if the plot has any deceased persons
-                const hasDeceasedPersons = Array.isArray(plot.verstorbene) && plot.verstorbene.length > 0;
-                
-                if (hasDeceasedPersons) {
-                  console.log('Setting occupied style for plot:', plot.grabId);
-                  mapFeature.setStyle(occupiedPlotStyle);
-                }
+                const plot = f.properties as Grave;
+                const hasDeceased =
+                  Array.isArray(plot.verstorbene) &&
+                  plot.verstorbene.length > 0;
 
-                return mapFeature;
+                if (hasDeceased) {
+                  feat.setStyle(occupiedPlotStyle);
+                }
+                return feat;
               } catch (e) {
-                console.error('Error processing plot:', e);
+                console.error('Plot error:', e);
                 return null;
               }
             })
-            .filter(feature => feature !== null) as Feature[];
+            .filter((f) => f !== null) as Feature[];
 
-          console.log(`Adding ${features.length} plot features to map`);
           this.plotsSource.addFeatures(features);
-        } else {
-          console.warn('No plot features found in response');
         }
 
-        // Fit view to features
-        const extent = this.gravesSource.getExtent();
-        if (extent) {
-          this.map.getView().fit(extent, {
+        const combinedExtent = createEmptyExtent();
+        extendExtent(combinedExtent, this.gravesSource.getExtent());
+        extendExtent(combinedExtent, this.plotsSource.getExtent());
+
+        if (combinedExtent.every(isFinite)) {
+          this.map.getView().fit(combinedExtent, {
             padding: [50, 50, 50, 50],
             maxZoom: 19,
-            duration: 500 // Smooth animation
+            duration: 500,
           });
         }
 
         this.isLoading = false;
       },
       error: (error) => {
-        console.error('Error loading data:', error);
-        this.error = error.message || 'Failed to load cemetery data';
+        console.error('Loading error:', error);
+        this.error = error.message || 'Failed to load data';
         this.isLoading = false;
-      }
+      },
     });
   }
 
-  // Required component methods for the template
   isGrave(feature: Feature | null): boolean {
     if (!feature) return false;
     const properties = feature.get('properties');
